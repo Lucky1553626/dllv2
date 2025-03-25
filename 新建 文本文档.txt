@@ -1,0 +1,136 @@
+#include <windows.h>
+#include <psapi.h>
+#include <wchar.h>
+#include <vector>
+#include <string>
+#include <mutex>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <chrono>
+
+#pragma comment(lib, "psapi.lib")
+
+using namespace std;
+using namespace std::chrono_literals;
+
+// 检测特征列表
+vector<wstring> memoryPatterns = {
+    L"游戏中弹出窗口自动确认", L"目标范围内缩地", L"取身上装备PID",
+    L"目标为队友时协助他", L"死亡回挂机点", L"空打地攻击不减",
+    L"自动登录游戏设置区", L"出售时背包全修", L"点击查询目标ID",
+    L"目标玩家或怪物", L"角色死亡时自动", L"一键锁定为目标玩家加血"
+};
+
+// 字符串转换函数
+static wstring string2wstring(const string& str) {
+    if (str.empty()) return L"";
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
+    wstring wstr(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstr[0], size_needed);
+    return wstr;
+}
+
+class ProcessScanner {
+private:
+    mutex logMutex;
+    wstring logFilePath;
+    bool debugMode = true;
+
+    void SafeLog(const wstring& msg) {
+        lock_guard<mutex> lock(logMutex);
+
+        auto now = chrono::system_clock::now();
+        time_t time = chrono::system_clock::to_time_t(now);
+        tm localTime;
+        localtime_s(&localTime, &time);
+
+        wstringstream wss;
+        wss << put_time(&localTime, L"%Y-%m-%d %H:%M:%S") << L" " << msg << L"\n";
+
+        OutputDebugStringW(wss.str().c_str());
+
+        wofstream logFile(logFilePath, ios::app);
+        if (logFile.is_open()) {
+            logFile.imbue(locale(""));
+            logFile << wss.str();
+            logFile.close();
+        }
+        else {
+            OutputDebugStringW((L"[错误] 无法写入日志文件: " + logFilePath).c_str());
+        }
+    }
+
+    bool ScanProcessMemory(DWORD pid) {
+        HANDLE hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+        if (!hProcess) {
+            SafeLog(L"[内存错误] 无法打开进程: " + to_wstring(pid));
+            return false;
+        }
+
+        MEMORY_BASIC_INFORMATION mbi;
+        vector<BYTE> rawBuffer;
+        bool found = false;
+
+        for (LPVOID address = 0;
+            VirtualQueryEx(hProcess, address, &mbi, sizeof(mbi));
+            address = (LPBYTE)mbi.BaseAddress + mbi.RegionSize)
+        {
+            if (mbi.State != MEM_COMMIT || mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) continue;
+
+            try {
+                rawBuffer.resize(mbi.RegionSize);
+                SIZE_T bytesRead = 0;
+                if (!ReadProcessMemory(hProcess, mbi.BaseAddress, rawBuffer.data(), mbi.RegionSize, &bytesRead)) {
+                    continue;
+                }
+
+                found |= ScanBufferWithEncoding(rawBuffer, L"UNICODE", pid);
+                found |= ScanBufferWithEncoding(rawBuffer, L"GBK", pid);
+                if (found) break;
+            }
+            catch (const bad_alloc&) {
+                SafeLog(L"[内存错误] 内存分配失败");
+            }
+        }
+        CloseHandle(hProcess);
+        return found;
+    }
+
+    bool ScanBufferWithEncoding(const vector<BYTE>& buffer, const wstring& encoding, DWORD pid) {
+        wstring content;
+        if (encoding == L"UNICODE") {
+            content.assign(reinterpret_cast<const wchar_t*>(buffer.data()), buffer.size() / sizeof(wchar_t));
+        }
+        else {
+            int wideLen = MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS,
+                reinterpret_cast<const char*>(buffer.data()),
+                static_cast<int>(buffer.size()), nullptr, 0);
+            if (wideLen <= 0) return false;
+
+            content.resize(wideLen);
+            MultiByteToWideChar(CP_ACP, 0, reinterpret_cast<const char*>(buffer.data()),
+                static_cast<int>(buffer.size()), &content[0], wideLen);
+        }
+
+        for (const auto& pattern : memoryPatterns) {
+            size_t pos = 0;
+            while ((pos = content.find(pattern, pos)) != wstring::npos) {
+                SafeLog(L"[内存检测] PID " + to_wstring(pid) + L" (" + encoding + L") 发现特征: " + pattern);
+                pos += pattern.length();
+            }
+        }
+        return false;
+    }
+
+public:
+    void ScanProcess(DWORD pid) {
+        ScanProcessMemory(pid);
+    }
+int main() {
+    ProcessScanner scanner;
+    DWORD pid = 1234; // 替换为实际的进程 ID
+    scanner.ScanProcess(pid);
+    return 0;
+}
+};    
